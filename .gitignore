@@ -1,0 +1,7 @@
+*.zip
+*.png.bak
+node_modules/
+.DS_Store
+Thumbs.db
+_*.mjs
+_*.py
