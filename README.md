@@ -36,6 +36,94 @@ Cipher Lens answers those, per site, live.
 
 Chrome shows a yellow "an extension is debugging this browser" bar while the extension reads a handshake. That is expected: the DevTools protocol is the only way an extension can see the real TLS parameters. The debugger detaches a few seconds after the page is loaded.
 
+## How detection works
+
+Cipher Lens does not read `Server:` headers or guess from the URL. Every number it shows comes from one of three places: the browser's own network stack (via the DevTools protocol), a DNS-over-HTTPS answer fetched by the extension, or a value the page reports about itself. The pipeline below is what actually happens for each tab.
+
+### 1. Navigation hooks
+
+`chrome.webNavigation` drives the lifecycle:
+
+| Event | What the extension does |
+| --- | --- |
+| `onBeforeNavigate` (main frame only) | Seeds a per-tab record with the requested host and scheme, attaches the debugger, and fires the three DoH lookups in parallel. |
+| `onCommitted` | Reads the committed URL. A redirect to a sibling host (bilibili.com -> www.bilibili.com) only swaps the hostname; a cross-origin hop (uih.feishu.cn -> accounts.feishu.cn) wipes the TLS/IP/DNS fields, because the old handshake belongs to a different site. |
+| `onCompleted` | Runs the fallback connection probe and schedules the debugger detach (6 s later, 15 s at the latest after navigation start). |
+| `tabs.onRemoved` | Drops the tab's record and detaches. |
+
+State lives in a `Map` keyed by tab id and is mirrored into `chrome.storage.session` (memory only) so a service-worker restart does not lose it.
+
+### 2. Transport facts (TLS, ALPN, cipher, remote IP)
+
+The extension calls `chrome.debugger.attach(tab, "1.3")` and then, over the DevTools protocol:
+
+1. `Network.enable` - subscribe to `Network.responseReceived`.
+2. `Network.setCacheDisabled` and `Network.setBypassServiceWorker` - force a real handshake instead of a cached response.
+3. `Page.enable` + `Page.getFrameTree` - remember the **main frame id**, so the main document is still recognised after a cross-origin redirect (iframes are filtered out by site family).
+
+Each `Network.responseReceived` event carries the facts directly:
+
+| Field | Used for |
+| --- | --- |
+| `response.protocol` | ALPN result: `h3` -> QUIC card green, `h2` / `http/1.1` -> TCP |
+| `response.securityDetails.protocol` | TLS version (a `QUIC` value is normalised to TLS 1.3, since QUIC always runs TLS 1.3) |
+| `response.securityDetails.cipher` | cipher suite, e.g. `AES_128_GCM` |
+| `response.securityDetails.keyExchange` | key-exchange group, when the server exposes one |
+| `response.securityDetails.sanList` | certificate names (first three) |
+| `response.remoteIPAddress` | the IP the browser actually connected to |
+| `response.status` / `statusText` | HTTP status row |
+
+Rules that keep these values honest:
+
+- A **main-document response that is not cached** always wins over subresources; subresources are only used to fill gaps.
+- Responses flagged `fromDiskCache`, `fromMemoryCache`, `fromServiceWorker` or `fromPrefetchCache` carry **no** `securityDetails` and **no** `remoteIPAddress`. They are accepted only as fallback, and the tooltip says so.
+- `quic` is derived from the final protocol string (`/h3|quic/`), so the six cards can never disagree with each other.
+
+### 3. DNS and DoH cross-check
+
+DoH is queried straight from the extension - no system resolver involved:
+
+- Endpoints are addressed by **literal IP**, so a poisoned or hijacked system resolver cannot redirect the DNS query itself: AliDNS `https://223.5.5.5/resolve`, AliDNS `https://223.6.6.6/resolve`, DNSPod `https://120.53.53.53/dns-query` (JSON API, `accept: application/dns-json`, `cache: no-store`).
+- For every host the extension asks for **A**, **AAAA** and **HTTPS (type 65)** records in parallel, with a 5 s timeout per resolver and a 5 min in-memory cache.
+- The **DoH card** turns green only when (a) at least one encrypted resolver answered, and (b) the IP the browser really used appears in that answer set (after normalising `::ffff:` forms and case for IPv6). If the answers disagree, the card goes red and the tooltip says the encrypted resolver is unreachable *or* the answers differ - which is exactly the signature of a poisoned resolver, or of CDN steering.
+- Private ranges (`10.`, `127.`, `192.168.`, `172.16-31.`, `fe80::`, `fc00::/7`) are called out as "resolved by internal DNS", because they can never match a public DoH answer.
+- The **ECH card** reads the same type-65 answer: the service advertises ECH when the `HTTPS` RR contains an `ech=` parameter. Only advertisement is claimed - the browser never tells an extension whether ECH was actually negotiated.
+
+### 4. Fallback probe when the handshake is missed
+
+If the debugger attaches after the document response, or the response came from cache, there is nothing to read. After `onCompleted` the extension then injects a tiny same-origin request via `Runtime.evaluate`:
+
+```js
+var i = new Image();
+i.src = location.origin + '/favicon.ico?probe=' + Date.now();
+fetch(location.origin + '/?probe=' + Date.now(), { cache: 'no-store', credentials: 'omit' });
+```
+
+The browser reuses the existing connection or opens a new one, and the resulting `Network.responseReceived` supplies `securityDetails` and `remoteIPAddress`. This is why a value can appear a moment after the page has finished loading, and why the TLS 1.3 tooltip suggests reloading when it shows "Not captured" on a cached page.
+
+### 5. URL probe
+
+The probe field performs a **real navigation**, not a `fetch()`:
+
+1. `chrome.tabs.create({ url, active: false })` - a background tab, so the same navigation hooks and the same measurement path apply as for any normal page.
+2. Poll the tab record every 350 ms for up to 18 s, stopping as soon as TLS, remote IP and the DNS verdict are all present (plain HTTP stops as soon as ALPN is known).
+3. Detach the debugger, delete the record, keep the result in `chrome.storage.session` as `lastProbe`, and close the tab 400 ms later.
+
+A real navigation is required on purpose: `fetch()` reuses an already-negotiated connection, so an HTTP/2 connection opened for the current page would make every probe report `h2`, and HSTS/redirect behaviour would differ from what a user actually gets. The tab therefore flashes briefly - that is a deliberate trade for correct numbers, and it is documented in the popup tooltip.
+
+### 6. Card decision rules
+
+| Card | Green | Red | Grey / other |
+| --- | --- | --- | --- |
+| DoH | encrypted resolver answered and its answer contains the real IP | resolver unreachable, or answers differ | `Pending` until both a DNS answer and a remote IP exist |
+| QUIC | `h3` in ALPN | `h2` / `http/1.1` | `?` while unknown |
+| ECH | `ech=` present in the type-65 RR | no `ech=`, or no type-65 record | - |
+| TLS 1.3 | negotiated TLS 1.3 | TLS 1.2 or older | `?` when no handshake was captured |
+| TLS 1.2 | negotiated TLS 1.2 (labelled *downgraded*) | TLS 1.3 in use | - |
+| Protocol | - | - | shows the ALPN string (`H3` / `H2` / `HTTP/1.1`) |
+
+Every card also has a hover panel listing the raw evidence (resolver names, A/AAAA answers, page IP, cipher, key exchange, certificate names, data source) and a plain-language note about what the metric can and cannot prove.
+
 ## What each card means
 
 | Card | Green | Red | What it proves |
