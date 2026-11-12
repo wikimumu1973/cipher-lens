@@ -1,6 +1,6 @@
 /* Cipher Lens - background service worker
  * Data sources:
- *  - TLS version / ALPN (h2/h3) / remote IP / cipher suite：chrome.debugger + CDP Network.responseReceived
+ *  - TLS version / ALPN (h2/h3) / remote IP / cipher suite: chrome.debugger + CDP Network.responseReceived
  *  - DNS (DoH) consistency, ECH advertisement: AliDNS DoH (223.5.5.5) / DNSPod (120.53.53.53) JSON API
  */
 const state = new Map();
