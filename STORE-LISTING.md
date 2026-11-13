@@ -17,9 +17,11 @@ Six colour-coded cards, per site, measured live from the browser's own network s
 - TLS 1.3 / TLS 1.2 - which handshake version was negotiated?
 - Protocol - h3, h2 or http/1.1, from the real ALPN result.
 
-Hover any card for the evidence: resolver answers, certificate names, cipher suite, key exchange and the exact decision logic.
+Passive by default: the cards fill in without touching the debugger, so Chrome never shows its "started debugging this browser" bar just because you opened the popup. Only TLS version and cipher suite on h2 sites need one extra click on **Deep scan**, which shows that bar for a few seconds and then removes it automatically. HTTP/3 sites get TLS 1.3 for free, because QUIC always runs TLS 1.3.
 
-URL probe: type any address and Cipher Lens loads it in a temporary background tab with your own browser, reports the same six metrics for that URL, then closes the tab and returns you to your page. Real navigation is used on purpose - fetch() reuses connections and would report the wrong protocol.
+Hover any card for the evidence: resolver answers, certificate names, cipher suite, key exchange, where each value came from, and the exact decision logic.
+
+URL probe: type any address and Cipher Lens loads it in a temporary background tab with your own browser, reports the same six metrics for that URL, then closes the tab and returns you to your page. Real navigation is used on purpose - fetch() reuses connections and would report the wrong protocol. The probe is passive too.
 
 Everything is local. No accounts, no analytics, no author server. The only outbound requests are the DNS-over-HTTPS lookups needed to answer the questions above, and the pages you ask it to probe.
 

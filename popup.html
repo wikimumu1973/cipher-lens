@@ -24,6 +24,9 @@ body{width:380px;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-ser
 .row span{color:#607d8b;flex:0 0 auto}
 .row strong{color:#263238;font-weight:600;text-align:right;word-break:break-all}
 .foot{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.btns{display:flex;gap:6px}
+#deep{border-color:#90a4ae;color:#37474f}
+#deep:disabled,#probeGo:disabled{opacity:.55;cursor:default}
 button{font-size:11px;padding:5px 10px;border:1px solid #7986cb;background:#fff;color:#3f51b5;border-radius:4px;cursor:pointer}
 button:hover{background:#e8eaf6}
 .ts{font-size:10px;color:#90a4ae}
@@ -69,14 +72,15 @@ button:hover{background:#e8eaf6}
     <div class="row"><span>IP match</span><strong id="d-doh">-</strong></div>
     <div class="row"><span>Encrypted resolver</span><strong id="d-via">-</strong></div>
     <div class="row"><span>Resolved IPs</span><strong id="d-dns">-</strong></div>
+    <div class="row"><span>TLS evidence</span><strong id="d-tls">-</strong></div>
     <div class="row"><span>Cipher suite</span><strong id="d-cipher">-</strong></div>
     <div class="row"><span>ECH record</span><strong id="d-ech">-</strong></div>
   </div>
   <div class="foot">
-    <button id="recheck">Re-check</button>
+    <span class="btns"><button id="recheck">Re-check</button><button id="deep" title="Read TLS version, cipher suite and certificate names over the DevTools protocol. Chrome shows its debugging banner only for the few seconds this scan runs.">Deep scan</button></span>
     <span class="ts" id="ts"></span>
   </div>
-  <div class="hint">Hover any card for the underlying evidence: resolver, certificate, cipher suite and decision logic</div>
+  <div class="hint">Passive by default - no debugging banner. Deep scan reads TLS details and shows Chrome&rsquo;s banner for a few seconds only.</div>
 </div>
 <div id="tip"></div>
 <script src="popup.js"></script>

@@ -1,14 +1,14 @@
 # Privacy Policy - Cipher Lens
 
-Last updated: 2026-05-20
+Last updated: 2026-11-14
 
 Cipher Lens is a local diagnostic tool. It has no backend, no account system, no analytics and no advertising.
 
 ## What the extension processes
 
 - The URL and hostname of the active tab, to display connection facts for that page.
-- Transport metadata of the page's own connection (TLS version, ALPN, cipher suite, key exchange, certificate names, remote IP), read locally from the browser via the DevTools protocol.
-- DNS answers returned to the extension's own DNS-over-HTTPS queries.
+- Transport metadata of the page's own connection: ALPN/protocol (h3, h2, http/1.1), remote IP, HTTP status and cache flag from `chrome.webRequest`; DNS answers returned to the extension's own DNS-over-HTTPS queries.
+- TLS version, cipher suite, key exchange and certificate names, read via the DevTools protocol **only while you press the Deep scan button**.
 
 ## Where data goes
 
@@ -21,18 +21,19 @@ The only outbound requests the extension itself makes are:
 
 ## Storage
 
-The most recent URL-probe result is kept in `chrome.storage.session`, which is memory-only and cleared when the browser closes. No persistent storage, no cookies, no identifiers.
+The most recent URL-probe result and the per-tab measurement state are kept in `chrome.storage.session`, which is memory-only and cleared when the browser closes. No persistent storage, no cookies, no identifiers.
 
 ## Permissions justification
 
-- `debugger`: required to read real TLS/ALPN/cipher/remote-IP values; the browser does not expose them through any other API. The debugger attaches only while a page is being measured.
 - `tabs`, `webNavigation`: map measured connections to the right tab and follow redirects.
-- `storage`: hold the last probe result in memory for the popup.
-- `scripting` and host permissions: fallback protocol detection and URL probing on arbitrary sites.
+- `webRequest` (with host access): read the response IP, HTTP status and cache flag of the main frame. This is the passive source of those values - it does not inspect or record request bodies, headers or URLs of subresources beyond matching the tab's main document.
+- `scripting` (with host access): read the page's own ALPN value when the content script was injected too late, and run URL probes on arbitrary sites.
+- `debugger`: used only by the Deep scan button, for a few seconds, to read TLS version, cipher suite, key exchange and certificate names - the browser exposes them through no other API. The debugger is detached as soon as the scan ends (also on failure), which removes Chrome's debugging banner.
+- `storage`: hold the last probe result and per-tab state in memory for the popup.
 
 ## Children / sensitive data
 
-The extension does not knowingly process personal data, health data, financial data, credentials or communications content. Only transport metadata of the pages you visit is read, and only while the popup is open.
+The extension does not knowingly process personal data, health data, financial data, credentials or communications content. Only transport metadata of the pages you visit is read.
 
 ## Changes
 

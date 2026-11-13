@@ -36,7 +36,7 @@ function render(d, tabUrl){
   if (plain){ setCard('tls13','no','No TLS'); setCard('tls12','no','No TLS'); }
   else if (tls.indexOf('1.3') >= 0){ setCard('tls13','yes','In use'); setCard('tls12','','Not used'); }
   else if (tls.indexOf('1.2') >= 0){ setCard('tls13','no','Not used'); setCard('tls12','yes','In use'); }
-  else { setCard('tls13','warn','?'); setCard('tls12','warn','?'); }
+  else { setCard('tls13','warn','Unknown'); setCard('tls12','warn','Unknown'); }
 
   const p = d.protocol || '';
   setCard('proto', p ? (d.quic ? 'yes' : '') : 'warn', p ? p.toUpperCase() : '?');
@@ -44,6 +44,7 @@ function render(d, tabUrl){
   setRow('status', d.status ? (String(d.status) + (d.statusText ? ' ' + d.statusText : '')) : (plain && d.protocol ? 'Plain response' : ''));
   setRow('final', d.finalUrl && d.finalUrl !== d.url ? d.finalUrl : '');
   setRow('ip', d.remoteIP);
+  setRow('tls', d.tls ? (d.tlsSource === 'quic' ? 'Implied by QUIC (always TLS 1.3)' : (d.tlsSource === 'cdp' ? 'CDP securityDetails (Deep scan)' : 'Captured')) : 'Not read - use Deep scan');
   setRow('doh', (d.dohAvailable === false ? 'DoH resolver unreachable; ' : '') + (d.dohDetail || 'Waiting for DNS comparison'));
   setRow('dns', (d.dnsA && d.dnsA.length) ? d.dnsA.slice(0,3).join(', ') : (d.dohAvailable === false ? 'DoH unavailable' : 'Querying'));
   setRow('via', d.dnsVia);
@@ -51,7 +52,7 @@ function render(d, tabUrl){
   setRow('ech', d.ech === true ? 'HTTPS RR contains ech= (server supports ECH)' : (d.ech === false ? 'HTTPS RR has no ech= parameter' : 'Waiting'));
   let ts = d.updated ? new Date(d.updated).toLocaleTimeString() : '';
   if (d.dbgError) ts += ' | ' + d.dbgError;
-  else if (!d.tls) ts += ' | TLS handshake not captured (cached or Service Worker response)';
+  else if (!d.tls) ts += ' | TLS not read - click Deep scan';
   document.getElementById('ts').textContent = ts;
   buildTips(d, tabUrl);
 }
@@ -95,8 +96,25 @@ async function load(){
 document.getElementById('recheck').addEventListener('click', async function(){
   if (probeMode){ doProbe(); return; }
   if (currentTabId == null) return;
-  document.getElementById('ts').textContent = 'Reloading page...';
+  document.getElementById('ts').textContent = 'Refreshing...';
   await chrome.runtime.sendMessage({ action:'recheck', tabId: currentTabId }).catch(function(){});
+  await load();
+});
+
+document.getElementById('deep').addEventListener('click', async function(){
+  if (probeMode || currentTabId == null) return;
+  const btn = this;
+  btn.disabled = true;
+  showBanner('Deep scan running - Chrome shows its debugging banner for a few seconds and then removes it.', false);
+  try {
+    const r = await chrome.runtime.sendMessage({ action:'deepScan', tabId: currentTabId });
+    if (!r || !r.ok) throw new Error((r && r.error) || 'Deep scan failed');
+    hideBanner();
+    render(r.data, currentUrl);
+  } catch(e){
+    showBanner('Deep scan failed: ' + esc(e && e.message || e), true);
+  }
+  btn.disabled = false;
 });
 
 chrome.runtime.onMessage.addListener(function(msg){
@@ -144,8 +162,8 @@ function buildTips(d, tabUrl){
   setTip('quic', 'QUIC - HTTP/3', [
     ['ALPN', proto ? proto.toUpperCase() : 'Not captured'],
     ['Is QUIC', d.quic === true ? 'Yes (h3 = HTTP/3 over QUIC)' : (proto ? 'No, over TCP' : 'Not captured')],
-    ['Decision basis', d.quic ? 'CDP securityDetails.protocol = QUIC' : 'CDP response.protocol'],
-    ['Data source', d.cachedHit ? 'includes cached/reused connection responses' : 'CDP Network.responseReceived']
+    ['Decision basis', 'renderer nextHopProtocol'],
+    ['Data source', d.cachedHit ? 'page-reported ALPN; response came from cache' : 'nextHopProtocol (real ALPN)']
   ], 'QUIC runs over UDP 443. "Disabled" usually means the site does not deploy HTTP/3 (bilibili and some zhihu edges are h2), or the network blocks UDP 443. Chrome enables QUIC by default - no flags needed.');
 
   setTip('ech', 'ECH - Encrypted Client Hello', [
@@ -156,20 +174,22 @@ function buildTips(d, tabUrl){
 
   const use13 = /1\.3/.test(tlsTxt);
   setTip('tls13', 'TLS 1.3', [
-    ['This handshake', tlsTxt ? (use13 ? 'TLS 1.3' : tlsTxt + ' (1.3 not used)') : 'Not captured'],
+    ['This handshake', tlsTxt ? (use13 ? 'TLS 1.3' : tlsTxt + ' (1.3 not used)') : 'Not read'],
+    ['Evidence', d.tlsSource === 'quic' ? 'Implied by QUIC - HTTP/3 always runs TLS 1.3' : (d.tlsSource === 'cdp' ? 'CDP securityDetails (Deep scan)' : 'Click Deep scan to read the handshake')],
     ['Cipher suite', d.cipher || 'Not captured'],
     ['Key exchange', d.keyExchange || 'Not captured'],
     ['Certificate names', d.san || 'Not captured'],
     ['QUIC site', d.quic ? 'h3 always uses TLS 1.3' : '—']
-  ], 'TLS 1.3 completes in a single RTT and keeps only AEAD cipher suites. If it shows "Not captured", reload the page once.');
+  ], 'TLS 1.3 completes in a single RTT and keeps only AEAD cipher suites. A site on HTTP/3 is provably on TLS 1.3; for h2 sites the version is only visible through Deep scan, which briefly uses the DevTools protocol.');
 
   const use12 = /1\.2/.test(tlsTxt);
   setTip('tls12', 'TLS 1.2', [
-    ['This handshake', tlsTxt ? (use12 ? 'TLS 1.2 (downgraded)' : tlsTxt + ' (1.2 not used)') : 'Not captured'],
+    ['This handshake', tlsTxt ? (use12 ? 'TLS 1.2 (downgraded)' : tlsTxt + ' (1.2 not used)') : 'Not read'],
+    ['Evidence', d.tlsSource === 'quic' ? 'QUIC - TLS 1.2 cannot carry HTTP/3' : (d.tlsSource === 'cdp' ? 'CDP securityDetails (Deep scan)' : 'Click Deep scan to read the handshake')],
     ['Cipher suite', d.cipher || 'Not captured'],
     ['Key exchange', d.keyExchange || 'Not captured'],
     ['Certificate names', d.san || 'Not captured']
-  ], 'Only sites or middleboxes without TLS 1.3 (legacy proxies, intranet gateways) fall back to 1.2.');
+  ], 'Only sites or middleboxes without TLS 1.3 (legacy proxies, intranet gateways) fall back to 1.2. Passive mode cannot prove the version on TCP sites, so use Deep scan when it matters.');
 
   const carrier = d.quic ? 'UDP 443 (QUIC)'
     : (proto === 'h2' ? 'TCP 443 (TLS + HTTP/2)'
@@ -178,7 +198,7 @@ function buildTips(d, tabUrl){
     ['ALPN', proto ? proto.toUpperCase() : 'Not captured'],
     ['Transport', carrier],
     ['Multiplexing', (proto === 'h2' || d.quic) ? 'Yes (multiplexed)' : 'No'],
-    ['Data source', 'CDP Network.responseReceived']
+    ['Data source', 'nextHopProtocol (renderer)']
   ], 'h3 = HTTP/3 over QUIC (UDP); h2 = HTTP/2 over TLS (TCP); http/1.1 = legacy. This is the value the browser engine actually negotiated.');
 }
 
@@ -229,7 +249,7 @@ async function doProbe(){
     render(d, d.finalUrl || v);
     const ms = d.probeMs ? (d.probeMs / 1000).toFixed(1) + 's' : '?';
     let b = 'Probe target <b>' + esc(d.finalUrl || v) + '</b> - took ' + ms;
-    if (d.status) b += ' · HTTP ' + d.status + (d.statusText ? ' ' + esc(d.statusText) : '');
+    if (d.status) b += ' | HTTP ' + d.status + (d.statusText ? ' ' + esc(d.statusText) : '');
     if (d.probeWarn) b += '<br>' + esc(d.probeWarn);
     b += '<br><a id="backCur">← Back to current tab</a>';
     showBanner(b, false);

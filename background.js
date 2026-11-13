@@ -1,7 +1,12 @@
 /* Cipher Lens - background service worker
- * Data sources:
- *  - TLS version / ALPN (h2/h3) / remote IP / cipher suite: chrome.debugger + CDP Network.responseReceived
- *  - DNS (DoH) consistency, ECH advertisement: AliDNS DoH (223.5.5.5) / DNSPod (120.53.53.53) JSON API
+ *
+ * Passive by default - no debugger, no Chrome "started debugging" banner:
+ *   - ALPN (h3 / h2 / http/1.1): content script, performance.getEntriesByType('navigation')[0].nextHopProtocol
+ *   - remote IP, HTTP status, cache flag: chrome.webRequest (main_frame responses)
+ *   - DNS (DoH) consistency, ECH advertisement: AliDNS DoH (223.5.5.5) / DNSPod (120.53.53.53) JSON API
+ *
+ * On explicit "Deep scan" only:
+ *   - TLS version, cipher suite, key exchange, certificate SANs: chrome.debugger + CDP securityDetails
  */
 const state = new Map();
 const dbg = new Set();
@@ -118,7 +123,57 @@ function reconcile(tabId){
   });
 }
 
-/* ---------- debugger ---------- */
+/* ---------- ALPN from the renderer (passive) ---------- */
+async function applyProtocol(tabId, proto){
+  const p = String(proto || '').toLowerCase();
+  if (!p) return get(tabId);
+  const s = get(tabId);
+  const quic = /h3|quic/.test(p);
+  const patch = { protocol: p, quic: quic };
+  // QUIC always runs TLS 1.3, so a genuine h3 ALPN proves TLS 1.3 without touching the debugger.
+  if (quic && !s.tls){ patch.tls = 'TLS 1.3'; patch.tlsSource = 'quic'; }
+  return put(tabId, patch);
+}
+
+/* ---------- ALPN read on demand (works even when the content script missed) ---------- */
+async function refreshProtocol(tabId){
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      func: function(){
+        try {
+          const nav = performance.getEntriesByType('navigation')[0];
+          return { protocol: nav && nav.nextHopProtocol ? nav.nextHopProtocol.toLowerCase() : null, hostname: location.hostname };
+        } catch(e){ return { protocol: null, hostname: location.hostname }; }
+      }
+    });
+    const r = out && out[0] && out[0].result;
+    if (r && r.protocol) return await applyProtocol(tabId, r.protocol);
+  } catch(e){}
+  return get(tabId);
+}
+
+/* ---------- passive HTTP facts ---------- */
+function applyWebRequest(d){
+  if (d.tabId < 0 || d.type !== 'main_frame') return;
+  const s = get(d.tabId);
+  if (!s.hostname) return;
+  let host = '';
+  try { host = new URL(d.url).hostname; } catch(e){ return; }
+  if (host !== s.hostname && !sameFamily(host, s.hostname)) return;
+  const patch = {};
+  if (d.ip) patch.remoteIP = d.ip;
+  if (d.statusCode) patch.status = d.statusCode;
+  if (d.fromCache) patch.cachedHit = true;
+  if (!Object.keys(patch).length) return;
+  put(d.tabId, patch).then(function(){ reconcile(d.tabId); });
+}
+// Two passive listeners: Service Worker wake-ups can miss the first event of a
+// navigation, and onCompleted arrives later from the network stack.
+chrome.webRequest.onResponseStarted.addListener(applyWebRequest, { urls: ['http://*/*', 'https://*/*'], types: ['main_frame'] });
+chrome.webRequest.onCompleted.addListener(applyWebRequest, { urls: ['http://*/*', 'https://*/*'], types: ['main_frame'] });
+
+/* ---------- debugger: only for an explicit deep scan ---------- */
 async function attach(tabId){
   if (dbg.has(tabId)) return true;
   try {
@@ -147,11 +202,6 @@ async function detach(tabId){
   if (!dbg.has(tabId)) return;
   dbg.delete(tabId);
   try { await chrome.debugger.detach({ tabId: tabId }); } catch(e){}
-}
-function scheduleDetach(tabId, ms){
-  const old = timers.get(tabId);
-  if (old) clearTimeout(old);
-  timers.set(tabId, setTimeout(function(){ timers.delete(tabId); detach(tabId); }, ms));
 }
 
 function sameFamily(a, b){
@@ -182,7 +232,7 @@ chrome.debugger.onEvent.addListener(function(src, method, p){
     patch.hostname = host;
     if (!sameFamily(host, s.hostname)){
       // Site family changed: recorded TLS/IP belong to the old site and must be dropped
-      patch.tls = null; patch.tlsRaw = null; patch.cipher = null; patch.keyExchange = null; patch.san = null;
+      patch.tls = null; patch.tlsRaw = null; patch.tlsSource = null; patch.cipher = null; patch.keyExchange = null; patch.san = null;
       patch.protocol = null; patch.quic = null; patch.remoteIP = null; patch.doh = null; patch.dohDetail = null;
       patch.ech = null; patch.httpsRR = null; patch.dnsA = null; patch.dnsAAAA = null; patch.dnsVia = null;
       enrichDns(tabId, host);
@@ -198,6 +248,7 @@ chrome.debugger.onEvent.addListener(function(src, method, p){
   if (sd && sd.protocol && (!s.tls || prefer)){
     patch.tls = (String(sd.protocol).toUpperCase() === 'QUIC') ? 'TLS 1.3' : sd.protocol;
     patch.tlsRaw = sd.protocol;
+    patch.tlsSource = 'cdp';
   }
   if (sd && sd.cipher && (!s.cipher || prefer)) patch.cipher = sd.cipher;
   if (sd && sd.keyExchange && (!s.keyExchange || prefer)) patch.keyExchange = sd.keyExchange;
@@ -207,27 +258,9 @@ chrome.debugger.onEvent.addListener(function(src, method, p){
   if (!Object.keys(patch).length) return;
   const protoFinal = patch.protocol || s.protocol || '';
   if (protoFinal) patch.quic = /h3|quic/.test(protoFinal);
+  if (patch.quic && !patch.tls && !s.tls){ patch.tls = 'TLS 1.3'; patch.tlsSource = 'quic'; }
   put(tabId, patch).then(function(){ reconcile(tabId); });
 });
-
-/* The main document response may be missed when CDP attaches after the request or when the response
-    came from cache/Service Worker. After the page loads, fetch a same-origin image so the browser
-    reuses or opens a connection and CDP can observe securityDetails and remoteIPAddress. */
-async function probeNetwork(tabId){
-  const s = get(tabId);
-  if (!s.hostname) return;
-  if (s.tls && s.remoteIP) return;
-  if (!dbg.has(tabId)){
-    const ok = await attach(tabId);
-    if (!ok) return;
-  }
-  try { await chrome.debugger.sendCommand({ tabId: tabId }, 'Network.setBypassServiceWorker', { bypass: true }); } catch(e){}
-  const expr = "(function(){try{var t=Date.now();var i=new Image();i.referrerPolicy='no-referrer';i.src=location.origin+'/favicon.ico?probe='+t;var f=function(){try{fetch(location.origin+'/?probe='+t,{cache:'no-store',credentials:'omit'}).catch(function(){})}catch(e){}};f();}catch(e){}})()";
-  try {
-    await chrome.debugger.sendCommand({ tabId: tabId }, 'Runtime.evaluate', { expression: expr, awaitPromise: false });
-    log('probe sent', tabId);
-  } catch(e){ log('probe failed', tabId, String(e && e.message || e)); }
-}
 
 chrome.debugger.onDetach.addListener(function(src){ if (src.tabId >= 0) dbg.delete(src.tabId); });
 
@@ -238,9 +271,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(function(d){
   try { host = new URL(d.url).hostname; } catch(e){ return; }
   state.set(d.tabId, { hostname: host, url: d.url, finalUrl: d.url, scheme: (function(){ try { return new URL(d.url).protocol; } catch(e){ return ''; } })(), status: null, tls:null, protocol:null, quic:null, ech:null, doh:null, remoteIP:null, updated: Date.now() });
   persist(); notify(d.tabId);
-  attach(d.tabId);
   enrichDns(d.tabId, host);
-  scheduleDetach(d.tabId, 15000);
 });
 
 chrome.webNavigation.onCommitted.addListener(function(d){
@@ -259,7 +290,7 @@ chrome.webNavigation.onCommitted.addListener(function(d){
     const patch = { hostname: host, url: d.url, finalUrl: d.url };
     try { patch.scheme = new URL(d.url).protocol; } catch(e){}
     if (!sameFamily(host, s.hostname)){
-      patch.tls = null; patch.tlsRaw = null; patch.cipher = null; patch.keyExchange = null; patch.san = null;
+      patch.tls = null; patch.tlsRaw = null; patch.tlsSource = null; patch.cipher = null; patch.keyExchange = null; patch.san = null;
       patch.protocol = null; patch.quic = null; patch.remoteIP = null; patch.doh = null; patch.dohDetail = null;
       patch.ech = null; patch.httpsRR = null; patch.dnsA = null; patch.dnsAAAA = null; patch.dnsVia = null;
     }
@@ -273,17 +304,37 @@ chrome.webNavigation.onCommitted.addListener(function(d){
   }
 });
 
-chrome.webNavigation.onCompleted.addListener(function(d){
-  if (d.frameId !== 0) return;
-  probeNetwork(d.tabId);
-  scheduleDetach(d.tabId, 6000);
-});
-
 chrome.tabs.onRemoved.addListener(function(tabId){ state.delete(tabId); mainFrame.delete(tabId); persist(); detach(tabId); });
 
-/* ---------- probe an arbitrary URL with the real browser ---------- */
+/* ---------- deep scan (explicit user action) ---------- */
 const sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
 
+async function deepScan(tabId){
+  const s0 = get(tabId);
+  if (!s0.hostname) return { ok: false, error: 'No page to scan in this tab' };
+  if (s0.scheme === 'http:') return { ok: false, error: 'Plain HTTP - there is no TLS handshake to read' };
+  const ok = await attach(tabId);
+  if (!ok) return { ok: false, error: get(tabId).dbgError || 'Could not attach the debugger' };
+  try {
+    const expr = "(function(){try{var t=Date.now();var i=new Image();i.referrerPolicy='no-referrer';i.src=location.origin+'/favicon.ico?cipherlens='+t;fetch(location.origin+'/?cipherlens='+t,{cache:'no-store',credentials:'omit'}).catch(function(){});}catch(e){}})()";
+    try { await chrome.debugger.sendCommand({ tabId: tabId }, 'Runtime.evaluate', { expression: expr, awaitPromise: false }); } catch(e){}
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000){
+      await sleep(300);
+      const s = get(tabId);
+      if (s.tls && s.tlsSource === 'cdp') break;
+      if (s.dbgError) break;
+    }
+  } finally {
+    await detach(tabId);
+  }
+  const s = get(tabId);
+  if (s.dbgError && !s.tls) return { ok: false, error: s.dbgError };
+  if (s.tlsSource !== 'cdp') return { ok: false, error: 'No handshake captured - reload the page, then scan again' };
+  return { ok: true, data: s };
+}
+
+/* ---------- probe an arbitrary URL with the real browser (passive) ---------- */
 async function probeUrl(rawUrl){
   let u;
   try { u = new URL(rawUrl); } catch(e){ throw new Error('Invalid URL - include the scheme, e.g. https://'); }
@@ -299,7 +350,7 @@ async function probeUrl(rawUrl){
     s = get(tabId) || {};
     if (s.dbgError) break;
     if (s.scheme === 'http:' && s.protocol) break;              // plain HTTP: ALPN is enough
-    if (s.tls && s.remoteIP && s.doh !== null && s.doh !== undefined) break;
+    if (s.protocol && s.remoteIP && s.doh !== null && s.doh !== undefined) break;
   }
   await sleep(250);
   s = get(tabId) || {};
@@ -308,17 +359,16 @@ async function probeUrl(rawUrl){
   out.probeUrl = u.href;
   out.url = u.href;   // keep the requested URL as the origin; finalUrl is the post-redirect address
   out.probeMs = Date.now() - t0;
-  if (!s.tls && s.scheme !== 'http:' && !s.dbgError) out.probeWarn = 'TLS handshake not captured (page may trigger a download, or the response arrived before CDP attached)';
+  if (!s.protocol) out.probeWarn = 'ALPN not reported - the page may not have finished loading, or it started a download';
   if (!s.hostname){
     try { await chrome.tabs.get(tabId); } catch(e){ out.probeWarn = 'Page did not load normally (download link or blocked)'; }
   }
 
-  try { await detach(tabId); } catch(e){}
   state.delete(tabId);
   await persist();
   setTimeout(function(){ try { chrome.tabs.remove(tabId).catch(function(){}); } catch(e){} }, 400);
   try { await chrome.storage.session.set({ lastProbe: out }); } catch(e){}
-  log('probe done', u.href, out.probeMs + 'ms', out.tls, out.protocol);
+  log('probe done', u.href, out.probeMs + 'ms', out.protocol, out.remoteIP);
   return out;
 }
 
@@ -326,14 +376,19 @@ async function probeUrl(rawUrl){
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse){
   if (!msg) return;
   if (msg.action === 'getInfo'){
-    sendResponse(get(msg.tabId));
-    return;
+    const tabId = msg.tabId;
+    (async function(){
+      const s = get(tabId);
+      // The content script reports ALPN on load; when it was injected too late
+      // (extension installed/reloaded after the page) read it directly.
+      if (!s.protocol) await refreshProtocol(tabId);
+      sendResponse(get(tabId));
+    })();
+    return true;
   }
   if (msg.action === 'fromContent' && sender.tab){
-    const tabId = sender.tab.id;
-    const s = get(tabId);
     const d = msg.data || {};
-    if (d.protocol && !s.protocol) put(tabId, { protocol: d.protocol, quic: /h3|quic/.test(d.protocol) });
+    if (d.protocol) applyProtocol(sender.tab.id, d.protocol);
     return;
   }
   if (msg.action === 'probeUrl'){
@@ -341,15 +396,33 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse){
       .catch(function(e){ sendResponse({ ok: false, error: String(e && e.message || e) }); });
     return true;
   }
+  if (msg.action === 'deepScan'){
+    deepScan(msg.tabId).then(function(r){ sendResponse(r); })
+      .catch(function(e){ sendResponse({ ok: false, error: String(e && e.message || e) }); });
+    return true;
+  }
   if (msg.action === 'recheck'){
+    const tabId = msg.tabId;
     (async function(){
-      const tabId = msg.tabId;
-      await detach(tabId);
-      await attach(tabId);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tabId }, 'Page.reload', { ignoreCache: true });
-        sendResponse({ ok: true });
-      } catch(e){ sendResponse({ ok: false, error: String(e && e.message || e) }); }
+      await refreshProtocol(tabId);
+      let s = get(tabId);
+      // A reload is the only way to re-observe the response metadata when the
+      // passive listeners missed this navigation.
+      if (s.hostname && (!s.status || !s.remoteIP) && s.scheme !== 'http:'){
+        try {
+          await chrome.tabs.reload(tabId, { bypassCache: false });
+          const t0 = Date.now();
+          while (Date.now() - t0 < 15000){
+            await sleep(500);
+            const c = get(tabId);
+            if (c.status && c.remoteIP && c.protocol) break;
+          }
+        } catch(e){}
+        await refreshProtocol(tabId);
+        s = get(tabId);
+      }
+      if (s.hostname) enrichDns(tabId, s.hostname);
+      sendResponse({ ok: true, data: get(tabId) });
     })();
     return true;
   }
@@ -362,4 +435,4 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse){
     if (r && r.tabsO) Object.keys(r.tabsO).forEach(function(k){ state.set(Number(k), r.tabsO[k]); });
   } catch(e){}
 })();
-log('ready v1.0.0');
+log('ready v1.1.0');
