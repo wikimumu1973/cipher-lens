@@ -435,4 +435,4 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse){
     if (r && r.tabsO) Object.keys(r.tabsO).forEach(function(k){ state.set(Number(k), r.tabsO[k]); });
   } catch(e){}
 })();
-log('ready v1.1.0');
+log('ready v1.1.1');

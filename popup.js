@@ -54,7 +54,12 @@ function render(d, tabUrl){
   if (d.dbgError) ts += ' | ' + d.dbgError;
   else if (!d.tls) ts += ' | TLS not read - click Deep scan';
   document.getElementById('ts').textContent = ts;
+  setVersion();
   buildTips(d, tabUrl);
+}
+
+function setVersion(){
+  try { document.getElementById('ver').textContent = 'Cipher Lens v' + chrome.runtime.getManifest().version; } catch (e) {}
 }
 
 let currentTabId = null;
@@ -263,3 +268,4 @@ async function doProbe(){
 }
 document.getElementById('probeGo').addEventListener('click', doProbe);
 document.getElementById('probeUrl').addEventListener('keydown', function(e){ if (e.key === 'Enter') doProbe(); });
+setVersion();
