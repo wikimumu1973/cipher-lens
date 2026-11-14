@@ -12,12 +12,14 @@ Cipher Lens is a local diagnostic tool. It has no backend, no account system, no
 
 ## Where data goes
 
-Nowhere. All processing happens inside the browser. No data is sent to the extension author or to any third-party service, and no data is sold or shared.
+The extension has no backend and no analytics. Measurements are computed inside the browser and are never sent to the extension author; nothing is sold or shared.
 
-The only outbound requests the extension itself makes are:
+The only outbound requests the extension makes are:
 
-1. DNS-over-HTTPS queries to public resolvers (AliDNS `223.5.5.5` / `223.6.6.6`, DNSPod `120.53.53.53`) for the host you are inspecting. These queries contain that hostname, as any DNS query would.
+1. DNS-over-HTTPS queries to public resolvers (AliDNS `223.5.5.5` / `223.6.6.6`, DNSPod `120.53.53.53`) for the host you are inspecting. As with any DNS query, that hostname is necessarily visible to the resolver.
 2. The page navigation you explicitly request with the URL probe.
+
+No data is stored on any server, and no identifier is attached to these requests.
 
 ## Storage
 
